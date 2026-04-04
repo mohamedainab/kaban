@@ -457,7 +457,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--confidence-threshold",
         type=float,
         default=0.3,
-        help="Minimum CREPE confidence to accept a pitch frame (default: 0.3)."
+        help="Minimum CREPE confidence to accept a pitch frame. "
+             "Accepts 0–1 (e.g. 0.3) or percent (e.g. 30). Default: 0.3."
     )
     p.add_argument(
         "--step-size",
@@ -500,6 +501,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    # Normalize confidence threshold: accept both 0.8 and 80 as 80%
+    if args.confidence_threshold > 1.0:
+        args.confidence_threshold = args.confidence_threshold / 100.0
 
     audio_path = Path(args.audio)
     if not audio_path.exists():
