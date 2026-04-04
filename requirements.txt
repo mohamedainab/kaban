@@ -1,0 +1,5 @@
+torch
+torchaudio
+torchcrepe
+librosa>=0.10.0
+numpy
