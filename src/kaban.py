@@ -183,6 +183,7 @@ def detect_pitch(
     for i in range(1, len(frequency) - 1):
         if frequency[i] <= 0 and frequency[i - 1] > 0 and frequency[i + 1] > 0:
             frequency[i] = (frequency[i - 1] + frequency[i + 1]) / 2.0
+            confidence[i] = (confidence[i - 1] + confidence[i + 1]) / 2.0
 
     return time, frequency, confidence
 
