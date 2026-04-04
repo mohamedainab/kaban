@@ -16,7 +16,7 @@ Kaban uses the [CREPE](https://github.com/maxrmorrison/torchcrepe) neural pitch 
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/kaban.git
+git clone https://github.com/mohamedainab/kaban.git
 cd kaban
 python3 -m venv .venv
 source .venv/bin/activate
