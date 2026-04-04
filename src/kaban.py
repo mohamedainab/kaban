@@ -96,7 +96,7 @@ def detect_pitch(
     model_capacity: str = "full",
     model_path: str | None = None,
     viterbi: bool = True,
-    confidence_threshold: float = 0.5,
+    frame_confidence_floor: float = 0.3,
     step_size: int = 10,  # ms
     chunk_seconds: float = 8.0,
     overlap_seconds: float = 3.0,
@@ -109,7 +109,7 @@ def detect_pitch(
     (except the first and last).
 
     Returns (time, frequency, confidence) arrays.
-    Frequencies below *confidence_threshold* are zeroed out (→ rest).
+    Frequencies below *frame_confidence_floor* are zeroed out (→ rest).
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -176,8 +176,8 @@ def detect_pitch(
     # Build time array
     time = np.arange(len(frequency)) * hop_samples / sr
 
-    # Zero out low-confidence frames
-    frequency = np.where(confidence >= confidence_threshold, frequency, 0.0)
+    # Zero out low-confidence frames (fixed internal floor for segmentation)
+    frequency = np.where(confidence >= frame_confidence_floor, frequency, 0.0)
 
     # Median-filter isolated dropouts (confidence dips in sustained notes)
     for i in range(1, len(frequency) - 1):
@@ -245,6 +245,7 @@ def segment_notes(
 
     # --- Step 1: smooth out isolated unvoiced frames ----------------------
     freq = frequency.copy()
+    conf = confidence.copy()
     gap_start = None
     for i in range(len(freq)):
         if freq[i] <= 0:
@@ -257,6 +258,11 @@ def segment_notes(
                     fill_val = freq[gap_start -
                                     1] if gap_start > 0 else freq[i]
                     freq[gap_start:i] = fill_val
+                    # Also fill confidence so gap-filled frames don't
+                    # drag down the note's average confidence.
+                    fill_conf = conf[gap_start -
+                                     1] if gap_start > 0 else conf[i]
+                    conf[gap_start:i] = fill_conf
                 gap_start = None
 
     # --- Step 2: segment into notes ---------------------------------------
@@ -300,7 +306,7 @@ def segment_notes(
 
         if not current_freqs:
             current_freqs.append(f)
-            current_confs.append(confidence[i])
+            current_confs.append(conf[i])
             start_idx = i
             continue
 
@@ -310,13 +316,13 @@ def segment_notes(
         if is_rest and prev_voiced:
             _flush(i - 1)
             current_freqs = [f]
-            current_confs = [confidence[i]]
+            current_confs = [conf[i]]
             start_idx = i
             continue
         if not is_rest and not prev_voiced:
             _flush(i - 1)
             current_freqs = [f]
-            current_confs = [confidence[i]]
+            current_confs = [conf[i]]
             start_idx = i
             continue
 
@@ -324,7 +330,7 @@ def segment_notes(
         if i in onset_frames and len(current_freqs) > 2 and not is_rest and any(ff > 0 for ff in current_freqs):
             _flush(i - 1)
             current_freqs = [f]
-            current_confs = [confidence[i]]
+            current_confs = [conf[i]]
             start_idx = i
             continue
 
@@ -337,12 +343,12 @@ def segment_notes(
                 if _cents_distance(f, median) > cent_tolerance:
                     _flush(i - 1)
                     current_freqs = [f]
-                    current_confs = [confidence[i]]
+                    current_confs = [conf[i]]
                     start_idx = i
                     continue
 
         current_freqs.append(f)
-        current_confs.append(confidence[i])
+        current_confs.append(conf[i])
 
     # Flush remaining
     if current_freqs:
@@ -403,8 +409,22 @@ def segment_notes(
 # Output formatting
 # ---------------------------------------------------------------------------
 
-def print_notes(notes: list[dict], output_format: str = "table") -> None:
-    """Print detected notes to stdout."""
+def print_notes(
+    notes: list[dict],
+    output_format: str = "table",
+    confidence_threshold: float = 0.0,
+) -> None:
+    """Print detected notes to stdout.
+
+    If *confidence_threshold* > 0, voiced notes whose average confidence
+    falls below the threshold are excluded from output.
+    """
+    if confidence_threshold > 0:
+        notes = [
+            n for n in notes
+            if n["note"] == "rest" or n["confidence"] >= confidence_threshold
+        ]
+
     if output_format == "json":
         import json
         print(json.dumps(notes, indent=2))
@@ -535,7 +555,6 @@ def main() -> None:
         model_capacity=args.model_capacity,
         model_path=args.model_path,
         viterbi=True,
-        confidence_threshold=args.confidence_threshold,
         step_size=args.step_size,
     )
     print(f"  {len(time)} frames detected", file=sys.stderr)
@@ -552,7 +571,7 @@ def main() -> None:
     )
 
     # 6. Output
-    print_notes(notes, output_format=args.output_format)
+    print_notes(notes, output_format=args.output_format, confidence_threshold=args.confidence_threshold)
 
 
 if __name__ == "__main__":
