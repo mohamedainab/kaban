@@ -25,6 +25,7 @@ import torchcrepe
 NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
 SHEET_FORMAT_CHOICES = ["musicxml", "midi", "both"]
+INSTRUMENT_CHOICES = ["guitar", "piano"]
 
 
 def hz_to_note_and_cents(frequency: float) -> tuple[str, int, float]:
@@ -487,11 +488,164 @@ def print_notes(
     print(f"\nTotal notes: {len(notes)}")
 
 
+def cents_distance(f1: float, f2: float) -> float:
+    """Return absolute cent distance between two frequencies."""
+    if f1 <= 0 or f2 <= 0:
+        return float("inf")
+    return abs(1200.0 * np.log2(f1 / f2))
+
+
+def prepare_sheet_notes_for_export(
+    raw_notes: list[dict],
+    simplify_sheet: bool = False,
+    ornament_max_duration: float = 0.10,
+    ornament_cents_tolerance: float = 120.0,
+    repeat_gap_seconds: float = 0.10,
+    repeat_cents_tolerance: float = 30.0,
+) -> list[dict]:
+    """Build a strictly monophonic note stream for sheet export.
+
+    Always drops rests and removes overlaps so the exported score never emits
+    simultaneous notes. When *simplify_sheet* is enabled, short ornaments are
+    absorbed into nearby notes and repeated nearby notes are collapsed.
+    """
+    if not raw_notes:
+        return []
+
+    events = [dict(n) for n in raw_notes if n["note"] != "rest"]
+    events.sort(key=lambda n: (float(n.get("start", 0.0)), float(n.get("end", 0.0))))
+
+    mono: list[dict] = []
+    for ev in events:
+        start = float(ev.get("start", 0.0))
+        dur = max(0.0, float(ev.get("duration", 0.0)))
+        end = float(ev.get("end", start + dur))
+        if end <= start:
+            continue
+
+        if mono:
+            prev = mono[-1]
+            prev_start = float(prev.get("start", 0.0))
+            prev_end = float(prev.get("end", prev_start + float(prev.get("duration", 0.0))))
+
+            if start < prev_end:
+                trimmed_prev_dur = max(0.0, start - prev_start)
+                if trimmed_prev_dur <= 0.0:
+                    prev_conf = float(prev.get("confidence", 0.0))
+                    curr_conf = float(ev.get("confidence", 0.0))
+                    if curr_conf > prev_conf:
+                        mono[-1] = ev
+                    continue
+
+                prev["duration"] = trimmed_prev_dur
+                prev["end"] = prev_start + trimmed_prev_dur
+
+        mono.append(ev)
+
+    mono = [n for n in mono if float(n.get("duration", 0.0)) > 0.0]
+    if not simplify_sheet:
+        return mono
+
+    # Absorb only short sandwiched ornaments, not standalone melodic steps.
+    simplified = [dict(n) for n in mono]
+    changed = True
+    while changed and len(simplified) > 1:
+        changed = False
+        next_notes: list[dict] = []
+        i = 0
+        while i < len(simplified):
+            current = dict(simplified[i])
+            current_dur = float(current.get("duration", 0.0))
+            if current_dur >= ornament_max_duration:
+                next_notes.append(current)
+                i += 1
+                continue
+
+            prev_note = next_notes[-1] if next_notes else None
+            next_note = simplified[i + 1] if i + 1 < len(simplified) else None
+            if prev_note is None or next_note is None:
+                next_notes.append(current)
+                i += 1
+                continue
+
+            dist_prev = cents_distance(
+                float(prev_note.get("frequency_hz", 0.0)),
+                float(current.get("frequency_hz", 0.0)),
+            )
+            dist_next = cents_distance(
+                float(next_note.get("frequency_hz", 0.0)),
+                float(current.get("frequency_hz", 0.0)),
+            )
+            dist_neighbours = cents_distance(
+                float(prev_note.get("frequency_hz", 0.0)),
+                float(next_note.get("frequency_hz", 0.0)),
+            )
+
+            if (
+                dist_neighbours > repeat_cents_tolerance
+                or min(dist_prev, dist_next) > ornament_cents_tolerance
+            ):
+                next_notes.append(current)
+                i += 1
+                continue
+
+            changed = True
+            if dist_prev <= dist_next:
+                prev_note["duration"] = float(prev_note["duration"]) + current_dur
+                prev_note["end"] = max(
+                    float(prev_note.get("end", 0.0)),
+                    float(current.get("end", 0.0)),
+                )
+            else:
+                next_note["duration"] = float(next_note["duration"]) + current_dur
+                next_note["start"] = min(
+                    float(next_note.get("start", 0.0)),
+                    float(current.get("start", 0.0)),
+                )
+            i += 1
+
+        simplified = next_notes
+
+    # Collapse repeated nearby notes of nearly the same pitch.
+    collapsed: list[dict] = []
+    for current in simplified:
+        if not collapsed:
+            collapsed.append(dict(current))
+            continue
+
+        prev = collapsed[-1]
+        gap = float(current.get("start", 0.0)) - float(prev.get("end", 0.0))
+        dist = cents_distance(
+            float(prev.get("frequency_hz", 0.0)),
+            float(current.get("frequency_hz", 0.0)),
+        )
+        if gap <= repeat_gap_seconds and dist <= repeat_cents_tolerance:
+            prev["duration"] = float(prev["duration"]) + float(current.get("duration", 0.0))
+            prev["end"] = max(float(prev.get("end", 0.0)), float(current.get("end", 0.0)))
+            prev["frequency_hz"] = round(
+                (float(prev.get("frequency_hz", 0.0)) + float(current.get("frequency_hz", 0.0))) / 2.0,
+                2,
+            )
+            prev["confidence"] = round(
+                max(float(prev.get("confidence", 0.0)), float(current.get("confidence", 0.0))),
+                3,
+            )
+            note_name, cents, _ = hz_to_note_and_cents(float(prev["frequency_hz"]))
+            prev["note"] = note_name
+            prev["cents"] = int(cents)
+        else:
+            collapsed.append(dict(current))
+
+    return [n for n in collapsed if float(n.get("duration", 0.0)) > 0.0]
+
+
 def export_music_sheet(
     notes: list[dict],
     output_path: str,
     sheet_format: str,
     tempo_bpm: int = 90,
+    instrument_name: str = "guitar",
+    simplify_sheet: bool = False,
 ) -> None:
     """Export detected notes to MusicXML or MIDI.
 
@@ -499,47 +653,78 @@ def export_music_sheet(
     quarter_length = duration_seconds * tempo_bpm / 60.
     """
     try:
-        from music21 import clef, instrument, meter, metadata, note as m21note, pitch, stream, tempo
+        from music21 import clef, instrument, layout, meter, metadata, note as m21note, pitch, stream, tempo
     except ImportError as exc:
         raise RuntimeError(
             "music21 is required for sheet export. Install with: pip install music21"
         ) from exc
 
-    def _prepare_sheet_notes(raw_notes: list[dict]) -> list[dict]:
-        """Drop all rest events so exported sheets contain only played notes."""
-        if not raw_notes:
-            return []
+    def _to_music21_note(n: dict, ql: float) -> m21note.Note:
+        ev = m21note.Note(n["note"], quarterLength=ql)
+        cents = int(n.get("cents", 0))
+        if cents != 0:
+            ev.pitch.microtone = pitch.Microtone(cents)
+        return ev
 
-        return [dict(n) for n in raw_notes if n["note"] != "rest"]
+    def _build_guitar_part(sheet_notes: list[dict], ql_step: float) -> stream.Part:
+        part = stream.Part(id="guitar")
+        oud = instrument.Instrument()
+        oud.instrumentName = "Arabic Oud"
+        part.partName = "Arabic Oud"
+        part.append(oud)
+        part.append(tempo.MetronomeMark(number=tempo_bpm))
+        # Oud lead notation is monophonic on a single treble staff.
+        part.append(clef.TrebleClef())
+        part.append(meter.TimeSignature("4/4"))
+
+        for n in sheet_notes:
+            ql = _quantize_quarter_length(float(n["duration"]), ql_step)
+            part.append(_to_music21_note(n, ql))
+
+        return part
+
+    def _build_piano_parts(sheet_notes: list[dict], ql_step: float) -> tuple[stream.PartStaff, stream.PartStaff]:
+        right = stream.PartStaff(id="piano-rh")
+        left = stream.PartStaff(id="piano-lh")
+
+        right.append(instrument.Piano())
+        right.append(tempo.MetronomeMark(number=tempo_bpm))
+        right.append(clef.TrebleClef())
+        right.append(meter.TimeSignature("4/4"))
+
+        left.append(clef.BassClef())
+        left.append(meter.TimeSignature("4/4"))
+
+        split_midi = 60  # C4 split between LH/RH
+        for n in sheet_notes:
+            ql = _quantize_quarter_length(float(n["duration"]), ql_step)
+            ev = _to_music21_note(n, ql)
+            if ev.pitch.midi >= split_midi:
+                right.append(ev)
+            else:
+                left.append(ev)
+
+        return right, left
 
     score = stream.Score(id="kaban-score")
     score.metadata = metadata.Metadata()
     score.metadata.title = "Kaban Export"
 
-    part = stream.Part(id="guitar")
-    part.append(instrument.AcousticGuitar())
-    part.append(tempo.MetronomeMark(number=tempo_bpm))
-    # Standard guitar notation: treble clef sounding one octave lower.
-    part.append(clef.Treble8vbClef())
-    part.append(meter.TimeSignature("4/4"))
-
-    def _quantize_quarter_length(duration_seconds: float) -> float:
-        # Quantize to 16th-note grid so durations are valid for MusicXML typing.
+    def _quantize_quarter_length(duration_seconds: float, step: float) -> float:
+        # Quantize to the profile-specific rhythmic grid for stable MusicXML.
         raw_ql = float(duration_seconds) * float(tempo_bpm) / 60.0
-        step = 0.25
         return max(step, round(raw_ql / step) * step)
 
-    sheet_notes = _prepare_sheet_notes(notes)
+    sheet_notes = prepare_sheet_notes_for_export(notes, simplify_sheet=simplify_sheet)
 
-    for n in sheet_notes:
-        ql = _quantize_quarter_length(float(n["duration"]))
-        ev = m21note.Note(n["note"], quarterLength=ql)
-        cents = int(n.get("cents", 0))
-        if cents != 0:
-            ev.pitch.microtone = pitch.Microtone(cents)
-        part.append(ev)
-
-    score.append(part)
+    if instrument_name == "piano":
+        right, left = _build_piano_parts(sheet_notes, ql_step=0.25)
+        score.append(right)
+        score.append(left)
+        score.insert(0, layout.StaffGroup([right, left], symbol="brace", barTogether=True, name="Piano"))
+    else:
+        ql_step = 0.5 if simplify_sheet else 0.25
+        score.append(_build_guitar_part(sheet_notes, ql_step=ql_step))
 
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -665,12 +850,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=90,
         help="Tempo used to map seconds to note lengths for score export (default: 90 BPM).",
     )
+    p.add_argument(
+        "--instrument",
+        choices=INSTRUMENT_CHOICES,
+        default="guitar",
+        help="Sheet export instrument profile (default: guitar, interpreted as Arabic Oud lead).",
+    )
+    p.add_argument(
+        "--simplify-sheet",
+        action="store_true",
+        help="Apply an Oud-focused lead-sheet simplification preset before export. Enabled by default for guitar/Oud sheets.",
+    )
+    p.add_argument(
+        "--no-simplify-sheet",
+        action="store_true",
+        help="Disable Oud/guitar sheet simplification and export a more faithful note stream.",
+    )
     return p
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.simplify_sheet and args.no_simplify_sheet:
+        print("Error: use only one of --simplify-sheet or --no-simplify-sheet", file=sys.stderr)
+        sys.exit(1)
+
+    if args.instrument == "guitar" and not args.no_simplify_sheet and "--simplify-sheet" not in sys.argv:
+        args.simplify_sheet = True
 
     # Normalize confidence threshold: accept both 0.8 and 80 as 80%
     if args.confidence_threshold > 1.0:
@@ -770,6 +978,8 @@ def main() -> None:
                 output_path=str(sheet_path),
                 sheet_format=fmt,
                 tempo_bpm=args.sheet_tempo,
+                instrument_name=args.instrument,
+                simplify_sheet=args.simplify_sheet,
             )
 
         print("  sheet export complete", file=sys.stderr)

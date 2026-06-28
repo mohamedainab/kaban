@@ -53,8 +53,17 @@ python src/kaban.py audio.wav --sheet-format musicxml
 # MIDI export
 python src/kaban.py audio.wav --sheet-format midi
 
+# Piano grand-staff MusicXML export
+python src/kaban.py audio.wav --sheet-format musicxml --instrument piano
+
 # Export both MusicXML and MIDI
 python src/kaban.py audio.wav --sheet-format both
+
+# Simplified Arabic Oud lead sheet
+python src/kaban.py audio.wav --sheet-format musicxml --instrument guitar --simplify-sheet
+
+# Faithful Arabic Oud sheet with less export-time reduction
+python src/kaban.py audio.wav --sheet-format musicxml --instrument guitar --no-simplify-sheet
 ```
 
 ### Options
@@ -74,6 +83,9 @@ python src/kaban.py audio.wav --sheet-format both
 | `--sheet-format` | — | Export score (`musicxml`, `midi`, or `both`) |
 | `--sheet-output` | auto | Score output path (for `both`, acts as stem/base name) |
 | `--sheet-tempo` | `90` | Tempo used for score duration mapping |
+| `--instrument` | `guitar` | Sheet profile (`guitar` = Arabic Oud lead, or `piano`) |
+| `--simplify-sheet` | on for `guitar` | Apply an Oud-focused simplification preset before export |
+| `--no-simplify-sheet` | off | Disable default Oud/guitar simplification for a more faithful export |
 
 ### Example output
 
@@ -128,7 +140,7 @@ python src/kaban.py audio.wav --model-path kaban_crepe.pth
 4. **CREPE pitch detection** in overlapping chunks for reliable periodicity
 5. **Note segmentation** groups pitch frames into discrete notes using sliding-window median comparison
 6. **Note refinement** merges adjacent same-pitch fragments while preserving onset boundaries
-7. **Sheet export** maps durations to notation-safe values, keeps microtonal cents, uses guitar staff, and removes rest events from the exported score
+7. **Sheet export** maps durations to notation-safe values, keeps microtonal cents, applies instrument-specific staff formatting (Arabic Oud lead or piano), removes rest events, enforces monophonic output (no chords), and can simplify dense lead sheets before export
 
 ## Algorithm
 
@@ -141,8 +153,9 @@ Kaban creates sheet output by converting continuous audio into symbolic note eve
 5. **Segmentation**: turn frame-level pitch into note events using cent-distance and voiced/unvoiced transitions.
 6. **Pitch labeling**: convert median event frequency to note + cent offset.
 7. **Notation mapping**: convert event durations to quarter lengths at the chosen tempo and quantize to a 16th-note grid.
-8. **Guitar formatting**: export as Acoustic Guitar with treble-8vb clef (standard guitar notation).
+8. **Instrument formatting**: guitar profile exports as Arabic Oud lead on treble staff; piano exports as grand staff (treble + bass).
 9. **Rest policy**: drop all rest events from sheet output to avoid empty silent gaps.
+10. **Optional simplification**: for Arabic Oud lead sheets, absorb short ornaments, collapse repeated nearby notes, and quantize to a coarser 8th-note grid.
 
 ```mermaid
 flowchart TD
@@ -155,7 +168,7 @@ flowchart TD
    G --> H[Note + Cents Labeling]
    H --> I[Duration Mapping + Quantization]
    I --> J[Drop Rest Events]
-   J --> K[Guitar Staff Formatting]
+   J --> K[Instrument Staff Formatting]
    K --> L[MusicXML or MIDI]
 ```
 
