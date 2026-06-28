@@ -46,6 +46,15 @@ python src/kaban.py audio.wav
 
 # JSON
 python src/kaban.py audio.wav --format json
+
+# MusicXML sheet export
+python src/kaban.py audio.wav --sheet-format musicxml
+
+# MIDI export
+python src/kaban.py audio.wav --sheet-format midi
+
+# Export both MusicXML and MIDI
+python src/kaban.py audio.wav --sheet-format both
 ```
 
 ### Options
@@ -62,6 +71,9 @@ python src/kaban.py audio.wav --format json
 | `--no-drone-separation` | — | Skip HPSS drone removal |
 | `--sample-rate` | `16000` | Audio resampling rate in Hz |
 | `--format` | `table` | Output format (`table` or `json`) |
+| `--sheet-format` | — | Export score (`musicxml`, `midi`, or `both`) |
+| `--sheet-output` | auto | Score output path (for `both`, acts as stem/base name) |
+| `--sheet-tempo` | `90` | Tempo used for score duration mapping |
 
 ### Example output
 
@@ -115,7 +127,37 @@ python src/kaban.py audio.wav --model-path kaban_crepe.pth
 3. **Onset detection** identifies note attack points
 4. **CREPE pitch detection** in overlapping chunks for reliable periodicity
 5. **Note segmentation** groups pitch frames into discrete notes using sliding-window median comparison
-6. **Post-processing** merges short rests and adjacent same-pitch fragments
+6. **Note refinement** merges adjacent same-pitch fragments while preserving onset boundaries
+7. **Sheet export** maps durations to notation-safe values, keeps microtonal cents, uses guitar staff, and removes rest events from the exported score
+
+## Algorithm
+
+Kaban creates sheet output by converting continuous audio into symbolic note events, then writing those events as MusicXML or MIDI.
+
+1. **Audio ingestion**: load mono audio and resample to 16 kHz.
+2. **Melody-focused preprocessing**: optional HPSS separates sustained drone from melodic content.
+3. **Onset detection**: detect attack times to split repeated notes even if pitch is similar.
+4. **Pitch tracking**: run CREPE in overlapping chunks with confidence filtering.
+5. **Segmentation**: turn frame-level pitch into note events using cent-distance and voiced/unvoiced transitions.
+6. **Pitch labeling**: convert median event frequency to note + cent offset.
+7. **Notation mapping**: convert event durations to quarter lengths at the chosen tempo and quantize to a 16th-note grid.
+8. **Guitar formatting**: export as Acoustic Guitar with treble-8vb clef (standard guitar notation).
+9. **Rest policy**: drop all rest events from sheet output to avoid empty silent gaps.
+
+```mermaid
+flowchart TD
+   A[Input Audio] --> B[Load and Resample 16 kHz]
+   B --> C[Optional HPSS Drone Separation]
+   C --> D[Onset Detection]
+   D --> E[CREPE Pitch Tracking]
+   E --> F[Frame Confidence Filtering]
+   F --> G[Note Segmentation]
+   G --> H[Note + Cents Labeling]
+   H --> I[Duration Mapping + Quantization]
+   I --> J[Drop Rest Events]
+   J --> K[Guitar Staff Formatting]
+   K --> L[MusicXML or MIDI]
+```
 
 ## Project structure
 

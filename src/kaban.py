@@ -7,11 +7,13 @@ note sequences at cent-level precision.
 """
 
 import argparse
+import gc
 import sys
 from pathlib import Path
 
 import librosa
 import numpy as np
+import scipy.signal
 import torch
 import torchcrepe
 
@@ -21,6 +23,8 @@ import torchcrepe
 # ---------------------------------------------------------------------------
 
 NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+
+SHEET_FORMAT_CHOICES = ["musicxml", "midi", "both"]
 
 
 def hz_to_note_and_cents(frequency: float) -> tuple[str, int, float]:
@@ -59,6 +63,14 @@ def load_audio(path: str, sr: int = 16000) -> tuple[np.ndarray, int]:
     """Load an audio file and resample to *sr* Hz mono."""
     audio, orig_sr = librosa.load(path, sr=sr, mono=True)
     return audio, sr
+
+
+def highpass_filter(
+    audio: np.ndarray, sr: int, cutoff: int = 80, order: int = 2
+) -> np.ndarray:
+    """Remove sub-*cutoff* Hz rumble and breath noise with a Butterworth HPF."""
+    sos = scipy.signal.butter(order, cutoff, btype="high", fs=sr, output="sos")
+    return scipy.signal.sosfilt(sos, audio)
 
 
 def separate_drone(audio: np.ndarray, sr: int) -> np.ndarray:
@@ -111,7 +123,12 @@ def detect_pitch(
     Returns (time, frequency, confidence) arrays.
     Frequencies below *frame_confidence_floor* are zeroed out (→ rest).
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
 
     # Optionally load a fine-tuned model
     if model_path is not None:
@@ -150,10 +167,18 @@ def detect_pitch(
             decoder=torchcrepe.decode.viterbi if viterbi else torchcrepe.decode.argmax,
             device=device,
             return_periodicity=True,
-            batch_size=512,
+            batch_size=128,
         )
         freq_chunk = freq_chunk.squeeze(0).cpu().numpy()
         conf_chunk = conf_chunk.squeeze(0).cpu().numpy()
+
+        # Free GPU / MPS memory between chunks
+        del audio_tensor
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        elif device == "mps":
+            torch.mps.empty_cache()
+        gc.collect()
 
         # Determine which frames to keep (discard overlap lead-in except for first chunk)
         overlap_frames = int(overlap_seconds / (step_size / 1000))
@@ -179,13 +204,29 @@ def detect_pitch(
     # Zero out low-confidence frames (fixed internal floor for segmentation)
     frequency = np.where(confidence >= frame_confidence_floor, frequency, 0.0)
 
-    # Median-filter isolated dropouts (confidence dips in sustained notes)
-    for i in range(1, len(frequency) - 1):
-        if frequency[i] <= 0 and frequency[i - 1] > 0 and frequency[i + 1] > 0:
-            frequency[i] = (frequency[i - 1] + frequency[i + 1]) / 2.0
-            confidence[i] = (confidence[i - 1] + confidence[i + 1]) / 2.0
+    # Median-filter isolated single-frame dropouts (vectorised)
+    if len(frequency) > 2:
+        drop = (
+            (frequency[1:-1] <= 0)
+            & (frequency[:-2] > 0)
+            & (frequency[2:] > 0)
+        )
+        idx = np.flatnonzero(drop) + 1  # offset back to original indices
+        frequency[idx] = (frequency[idx - 1] + frequency[idx + 1]) / 2.0
+        confidence[idx] = (confidence[idx - 1] + confidence[idx + 1]) / 2.0
 
     return time, frequency, confidence
+
+
+def clamp_vocal_range(
+    frequency: np.ndarray,
+    floor_hz: float = 80.0,
+    ceil_hz: float = 1100.0,
+) -> np.ndarray:
+    """Zero out frequencies outside the human vocal range."""
+    return np.where(
+        (frequency >= floor_hz) & (frequency <= ceil_hz), frequency, 0.0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +487,91 @@ def print_notes(
     print(f"\nTotal notes: {len(notes)}")
 
 
+def export_music_sheet(
+    notes: list[dict],
+    output_path: str,
+    sheet_format: str,
+    tempo_bpm: int = 90,
+) -> None:
+    """Export detected notes to MusicXML or MIDI.
+
+    Durations are mapped from seconds to quarter lengths via tempo:
+    quarter_length = duration_seconds * tempo_bpm / 60.
+    """
+    try:
+        from music21 import clef, instrument, meter, metadata, note as m21note, pitch, stream, tempo
+    except ImportError as exc:
+        raise RuntimeError(
+            "music21 is required for sheet export. Install with: pip install music21"
+        ) from exc
+
+    def _prepare_sheet_notes(raw_notes: list[dict]) -> list[dict]:
+        """Drop all rest events so exported sheets contain only played notes."""
+        if not raw_notes:
+            return []
+
+        return [dict(n) for n in raw_notes if n["note"] != "rest"]
+
+    score = stream.Score(id="kaban-score")
+    score.metadata = metadata.Metadata()
+    score.metadata.title = "Kaban Export"
+
+    part = stream.Part(id="guitar")
+    part.append(instrument.AcousticGuitar())
+    part.append(tempo.MetronomeMark(number=tempo_bpm))
+    # Standard guitar notation: treble clef sounding one octave lower.
+    part.append(clef.Treble8vbClef())
+    part.append(meter.TimeSignature("4/4"))
+
+    def _quantize_quarter_length(duration_seconds: float) -> float:
+        # Quantize to 16th-note grid so durations are valid for MusicXML typing.
+        raw_ql = float(duration_seconds) * float(tempo_bpm) / 60.0
+        step = 0.25
+        return max(step, round(raw_ql / step) * step)
+
+    sheet_notes = _prepare_sheet_notes(notes)
+
+    for n in sheet_notes:
+        ql = _quantize_quarter_length(float(n["duration"]))
+        ev = m21note.Note(n["note"], quarterLength=ql)
+        cents = int(n.get("cents", 0))
+        if cents != 0:
+            ev.pitch.microtone = pitch.Microtone(cents)
+        part.append(ev)
+
+    score.append(part)
+
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fmt = "musicxml" if sheet_format == "musicxml" else "midi"
+    score.write(fmt=fmt, fp=str(target))
+
+
+def resolve_sheet_targets(
+    audio_path: Path,
+    sheet_format: str,
+    sheet_output: str | None,
+) -> list[tuple[str, Path]]:
+    """Resolve concrete export targets based on CLI options."""
+    if sheet_format != "both":
+        if sheet_output:
+            return [(sheet_format, Path(sheet_output))]
+        ext = ".musicxml" if sheet_format == "musicxml" else ".mid"
+        return [(sheet_format, audio_path.with_suffix(ext))]
+
+    # both: infer two paths from provided output stem or input stem
+    if sheet_output:
+        base = Path(sheet_output)
+        stem = base.with_suffix("")
+    else:
+        stem = audio_path.with_suffix("")
+
+    return [
+        ("musicxml", stem.with_suffix(".musicxml")),
+        ("midi", stem.with_suffix(".mid")),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -516,6 +642,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=16000,
         help="Resample audio to this rate in Hz (default: 16000).",
     )
+    p.add_argument(
+        "--vocal",
+        action="store_true",
+        help="Vocal mode: high-pass filter, vocal range clamping, "
+             "skip drone separation, and vocal-tuned segmentation defaults.",
+    )
+    p.add_argument(
+        "--sheet-format",
+        choices=SHEET_FORMAT_CHOICES,
+        default=None,
+        help="Export a score file in this format (musicxml or midi).",
+    )
+    p.add_argument(
+        "--sheet-output",
+        default=None,
+        help="Output path for score export. If omitted, derives from input filename.",
+    )
+    p.add_argument(
+        "--sheet-tempo",
+        type=int,
+        default=90,
+        help="Tempo used to map seconds to note lengths for score export (default: 90 BPM).",
+    )
     return p
 
 
@@ -537,8 +686,11 @@ def main() -> None:
     audio, sr = load_audio(str(audio_path), sr=args.sample_rate)
     print(f"  {len(audio)/sr:.2f}s @ {sr} Hz", file=sys.stderr)
 
-    # 2. Drone separation
-    if not args.no_drone_separation:
+    # 2. Preprocessing
+    if args.vocal:
+        print("Vocal mode: applying high-pass filter …", file=sys.stderr)
+        audio = highpass_filter(audio, sr)
+    elif not args.no_drone_separation:
         print("Applying HPSS drone separation …", file=sys.stderr)
         audio = separate_drone(audio, sr)
 
@@ -548,31 +700,79 @@ def main() -> None:
     print(f"  {len(onset_times)} onsets found", file=sys.stderr)
 
     # 4. Pitch detection
-    model_label = args.model_path or args.model_capacity
-    print(f"Running CREPE ({model_label}) …", file=sys.stderr)
+    # Vocal mode: use faster defaults unless the user overrode them.
+    model_cap = args.model_capacity
+    step = args.step_size
+    if args.vocal:
+        if "--model-capacity" not in sys.argv:
+            model_cap = "tiny"
+        if "--step-size" not in sys.argv:
+            step = 20
+
+    model_label = args.model_path or model_cap
+    print(f"Running CREPE ({model_label}, step={step}ms) …", file=sys.stderr)
     time, frequency, confidence = detect_pitch(
         audio,
         sr,
-        model_capacity=args.model_capacity,
+        model_capacity=model_cap,
         model_path=args.model_path,
         viterbi=True,
-        step_size=args.step_size,
+        step_size=step,
     )
     print(f"  {len(time)} frames detected", file=sys.stderr)
 
+    # 4b. Vocal range clamping
+    if args.vocal:
+        print("Clamping to vocal range (80–1100 Hz) …", file=sys.stderr)
+        frequency = clamp_vocal_range(frequency)
+
     # 5. Segment into notes
+    # Vocal mode overrides segmentation defaults unless the user set them explicitly.
+    cent_tol = args.cent_tolerance
+    min_dur = args.min_duration
+    min_rst = args.min_rest
+    if args.vocal:
+        if "--cent-tolerance" not in sys.argv:
+            cent_tol = 40
+        if "--min-duration" not in sys.argv:
+            min_dur = 0.05
+        if "--min-rest" not in sys.argv:
+            min_rst = 0.10
+
     notes = segment_notes(
         time,
         frequency,
         confidence,
         onset_times=onset_times,
-        cent_tolerance=args.cent_tolerance,
-        min_duration=args.min_duration,
-        min_rest=args.min_rest,
+        cent_tolerance=cent_tol,
+        min_duration=min_dur,
+        min_rest=min_rst,
     )
 
     # 6. Output
     print_notes(notes, output_format=args.output_format, confidence_threshold=args.confidence_threshold)
+
+    # 7. Optional score export
+    if args.sheet_format is not None:
+        targets = resolve_sheet_targets(
+            audio_path=audio_path,
+            sheet_format=args.sheet_format,
+            sheet_output=args.sheet_output,
+        )
+
+        for fmt, sheet_path in targets:
+            print(
+                f"Exporting {fmt} sheet to {sheet_path} ...",
+                file=sys.stderr,
+            )
+            export_music_sheet(
+                notes,
+                output_path=str(sheet_path),
+                sheet_format=fmt,
+                tempo_bpm=args.sheet_tempo,
+            )
+
+        print("  sheet export complete", file=sys.stderr)
 
 
 if __name__ == "__main__":
